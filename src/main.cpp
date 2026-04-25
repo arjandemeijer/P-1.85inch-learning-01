@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <Arduino_GFX_Library.h>
+#include <LittleFS.h>
+#include <TJpg_Decoder.h>
 
 // --- Pins ---
 #define I2C_SDA 11
@@ -130,29 +132,50 @@ static const InitCmd st77916_init[] = {
 static const int W = 360, H = 360;
 uint16_t *framebuffer = nullptr;
 
-static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
-    return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+// TJpg_Decoder callback: copy each decoded 16x16 block into the framebuffer.
+// setSwapBytes(true) ensures pixels are already byte-swapped (big-endian) for
+// direct framebuffer use, matching how the ST77916 expects the data.
+bool jpg_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
+    if (y >= H) return false;
+    for (uint16_t row = 0; row < h; row++) {
+        int16_t fy = y + row;
+        if (fy >= H) break;
+        uint16_t cols = min((int)(W - x), (int)w);
+        if (cols <= 0) continue;
+        memcpy(framebuffer + fy * W + x, bitmap + row * w, cols * 2);
+    }
+    return true;
 }
 
-// 256-entry rainbow lookup (already byte-swapped for direct framebuffer write).
-static uint16_t hueLut[256];
+// --- MJPEG state ---
+static uint8_t *mjpeg_buf  = nullptr;
+static size_t   mjpeg_size = 0;
+static size_t   mjpeg_pos  = 0;
 
-static uint16_t hsv2rgb565(uint8_t h, uint8_t s, uint8_t v) {
-    uint8_t region = h / 43;
-    uint8_t remainder = (h - region * 43) * 6;
-    uint8_t p = (v * (uint16_t)(255 - s)) >> 8;
-    uint8_t q = (v * (uint16_t)(255 - ((s * remainder) >> 8))) >> 8;
-    uint8_t t = (v * (uint16_t)(255 - ((s * (uint16_t)(255 - remainder)) >> 8))) >> 8;
-    uint8_t r, g, b;
-    switch (region) {
-        case 0: r = v; g = t; b = p; break;
-        case 1: r = q; g = v; b = p; break;
-        case 2: r = p; g = v; b = t; break;
-        case 3: r = p; g = q; b = v; break;
-        case 4: r = t; g = p; b = v; break;
-        default: r = v; g = p; b = q; break;
+// Find the next JPEG frame (SOI=FFD8 … EOI=FFD9) in the MJPEG buffer.
+// Advances mjpeg_pos past the found frame. Resets to 0 when EOF is reached
+// so playback loops continuously.
+bool next_frame(const uint8_t **out, size_t *len) {
+    while (mjpeg_pos + 1 < mjpeg_size) {
+        if (mjpeg_buf[mjpeg_pos] == 0xFF && mjpeg_buf[mjpeg_pos + 1] == 0xD8) {
+            size_t start = mjpeg_pos;
+            size_t j = start + 2;
+            while (j + 1 < mjpeg_size) {
+                if (mjpeg_buf[j] == 0xFF && mjpeg_buf[j + 1] == 0xD9) {
+                    *out     = mjpeg_buf + start;
+                    *len     = j + 2 - start;
+                    mjpeg_pos = j + 2;
+                    return true;
+                }
+                j++;
+            }
+            // Incomplete frame at end of buffer — stop and loop
+            break;
+        }
+        mjpeg_pos++;
     }
-    return rgb565(r, g, b);
+    mjpeg_pos = 0;  // restart for looping
+    return false;
 }
 
 // Send one init command via the QSPI bus.
@@ -204,42 +227,48 @@ void setup() {
     tca_set_pin(EXIO_LCD_RST, true);  delay(120);
     Serial.println("LCD reset done.");
 
-    // Init the QSPI bus (but NOT the ST77916 via Arduino_GFX — we do that ourselves)
     bus->begin();
     Serial.println("QSPI bus ready.");
 
-    // Run the full Waveshare init sequence
     Serial.printf("Sending %d init commands...\n", (int)INIT_CMD_COUNT);
     for (size_t i = 0; i < INIT_CMD_COUNT; i++) {
         sendInitCmd(st77916_init[i].cmd, st77916_init[i].data, st77916_init[i].len);
         if (st77916_init[i].delay_ms) delay(st77916_init[i].delay_ms);
     }
-    Serial.println("Init complete.");
+    Serial.println("Display init complete.");
 
     framebuffer = (uint16_t*) ps_calloc(W * H, sizeof(uint16_t));
-    if (!framebuffer) { Serial.println("FB fail"); while (1) delay(1000); }
+    if (!framebuffer) { Serial.println("FB alloc fail"); while (1) delay(1000); }
 
-    for (int i = 0; i < 256; i++) {
-        hueLut[i] = __builtin_bswap16(hsv2rgb565((uint8_t)i, 255, 255));
+    // Mount LittleFS — upload filesystem first with: pio run -t uploadfs
+    if (!LittleFS.begin(false)) {
+        Serial.println("LittleFS mount failed — run: pio run -t uploadfs");
+        while (1) delay(1000);
     }
-    Serial.println("Rainbow LUT ready. Entering render loop.");
+
+    File f = LittleFS.open("/output.mjpeg", "r");
+    if (!f) { Serial.println("Cannot open /output.mjpeg"); while (1) delay(1000); }
+    mjpeg_size = f.size();
+    Serial.printf("MJPEG: %u bytes\n", mjpeg_size);
+
+    mjpeg_buf = (uint8_t*) ps_malloc(mjpeg_size);
+    if (!mjpeg_buf) { Serial.println("MJPEG buf alloc fail"); while (1) delay(1000); }
+    f.read(mjpeg_buf, mjpeg_size);
+    f.close();
+    Serial.println("MJPEG loaded into PSRAM.");
+
+    TJpgDec.setSwapBytes(true);   // output byte-swapped RGB565 to match our framebuffer
+    TJpgDec.setCallback(jpg_output);
+    TJpgDec.setJpgScale(1);
+    Serial.println("Entering playback loop.");
 }
 
 void loop() {
-    // One full rotation every 5000 ms.
-    float angle = (millis() % 50000) * (2.0f * (float)M_PI / 50000.0f);
-    int16_t ca = (int16_t)(cosf(angle) * 256.0f);
-    int16_t sa = (int16_t)(sinf(angle) * 256.0f);
-    const int cx = W / 2, cy = H / 2;
-
-    for (int y = 0; y < H; y++) {
-        int32_t yProj = (int32_t)(y - cy) * sa;
-        uint16_t *row = framebuffer + y * W;
-        for (int x = 0; x < W; x++) {
-            int32_t proj = (int32_t)(x - cx) * ca + yProj;
-            uint8_t idx = (uint8_t)((proj >> 8) + 128);
-            row[x] = hueLut[idx];
-        }
+    const uint8_t *frame;
+    size_t frame_len;
+    if (next_frame(&frame, &frame_len)) {
+        TJpgDec.drawJpg(0, 0, frame, frame_len);
+        pushFramebuffer();
     }
-    pushFramebuffer();
+    // next_frame() resets mjpeg_pos to 0 at EOF → seamless loop
 }
