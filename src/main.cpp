@@ -18,7 +18,7 @@
 // Backlight brightness, 8-bit PWM duty cycle.
 // Range: 0 = off, 255 = max brightness. Below ~10 is nearly invisible; above ~200 is very bright.
 // Comfortable indoor range is roughly 40..120.
-#define LCD_BL_BRIGHTNESS 10
+#define LCD_BL_BRIGHTNESS 120
 #define LCD_BL_PWM_FREQ   20000   // Hz, well above audible + above visible flicker
 
 #define TCA9554_ADDR       0x20
@@ -264,6 +264,7 @@ void setup() {
 }
 
 void loop() {
+    
     const uint8_t *frame;
     size_t frame_len;
     if (next_frame(&frame, &frame_len)) {

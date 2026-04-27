@@ -1,5 +1,14 @@
 # MJPEG afspelen op 1.85" Waveshare display (ESP32-S3)
 
+De blender MP4 omzetten naar .MJPEG
+```
+ffmpeg -i t1.mp4 -vf "scale=360:360,fps=24" -q:v 16 -an output.mjpeg
+```
+
+```
+
+```
+
 ## Doel
 
 Een MJPEG-videobestand frame voor frame decoderen en afspelen op het ronde 360×360 ST77916 display via de `bodmer/TJpg_Decoder` library.
