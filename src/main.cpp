@@ -215,21 +215,27 @@ void setup() {
     delay(1500);
     Serial.println("\n=== Boot ===");
 
+    // Backlight
     ledcAttach(LCD_BL, LCD_BL_PWM_FREQ, 8);
     ledcWrite(LCD_BL, LCD_BL_BRIGHTNESS);
 
+    // I2C + IO expander
     Wire.begin(I2C_SDA, I2C_SCL);
     if (!tca_write_reg(TCA9554_REG_CONFIG, 0x00)) {
         Serial.println("TCA9554 fail"); while (1) delay(1000);
     }
+
+    // Display reset pulse
     tca_set_pin(EXIO_LCD_RST, true);  delay(10);
     tca_set_pin(EXIO_LCD_RST, false); delay(20);
     tca_set_pin(EXIO_LCD_RST, true);  delay(120);
     Serial.println("LCD reset done.");
 
+    // QSPI bus
     bus->begin();
     Serial.println("QSPI bus ready.");
 
+    // ST77916 init sequence
     Serial.printf("Sending %d init commands...\n", (int)INIT_CMD_COUNT);
     for (size_t i = 0; i < INIT_CMD_COUNT; i++) {
         sendInitCmd(st77916_init[i].cmd, st77916_init[i].data, st77916_init[i].len);
@@ -237,39 +243,48 @@ void setup() {
     }
     Serial.println("Display init complete.");
 
+    // Framebuffer in PSRAM
     framebuffer = (uint16_t*) ps_calloc(W * H, sizeof(uint16_t));
     if (!framebuffer) { Serial.println("FB alloc fail"); while (1) delay(1000); }
 
-    // Mount LittleFS — upload filesystem first with: pio run -t uploadfs
+    // LittleFS mount
     if (!LittleFS.begin(false)) {
         Serial.println("LittleFS mount failed — run: pio run -t uploadfs");
         while (1) delay(1000);
     }
 
-    File f = LittleFS.open("/output.mjpeg", "r");
-    if (!f) { Serial.println("Cannot open /output.mjpeg"); while (1) delay(1000); }
-    mjpeg_size = f.size();
-    Serial.printf("MJPEG: %u bytes\n", mjpeg_size);
+    Serial.println("--- Filesystem contents ---");
+    File root = LittleFS.open("/");
+    File file = root.openNextFile();
+    while (file) {
+        Serial.printf("  %s  (%u bytes)\n", file.name(), file.size());
+        file = root.openNextFile();
+    }
+    Serial.println("---------------------------");
 
-    mjpeg_buf = (uint8_t*) ps_malloc(mjpeg_size);
-    if (!mjpeg_buf) { Serial.println("MJPEG buf alloc fail"); while (1) delay(1000); }
-    f.read(mjpeg_buf, mjpeg_size);
-    f.close();
-    Serial.println("MJPEG loaded into PSRAM.");
-
-    TJpgDec.setSwapBytes(true);   // output byte-swapped RGB565 to match our framebuffer
+    // ---- Static JPEG test ----
+    TJpgDec.setSwapBytes(true);
     TJpgDec.setCallback(jpg_output);
     TJpgDec.setJpgScale(1);
-    Serial.println("Entering playback loop.");
+
+    File jpgFile = LittleFS.open("/paw.jpg", "r");
+    if (!jpgFile) {
+        Serial.println("Failed to open paw.jpg");
+    } else {
+        size_t jpgSize = jpgFile.size();
+        uint8_t *jpgBuf = (uint8_t*) ps_malloc(jpgSize);
+        jpgFile.read(jpgBuf, jpgSize);
+        jpgFile.close();
+        Serial.printf("Loaded paw.jpg: %u bytes\n", jpgSize);
+        
+        TJpgDec.drawJpg(0, 0, jpgBuf, jpgSize);
+        free(jpgBuf);
+    }
+
+    pushFramebuffer();
+    Serial.println("Static JPEG drawn.");
 }
 
 void loop() {
-    
-    const uint8_t *frame;
-    size_t frame_len;
-    if (next_frame(&frame, &frame_len)) {
-        TJpgDec.drawJpg(0, 0, frame, frame_len);
-        pushFramebuffer();
-    }
-    // next_frame() resets mjpeg_pos to 0 at EOF → seamless loop
-}
+    // niets nodig — beeld blijft staan
+} 
